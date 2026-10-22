@@ -6,7 +6,9 @@
  * v0.2.0 改为非模态 QDialog: 菜单点击必弹窗, 关闭只是隐藏。
  *
  * 布局: 固定 5 个监听位, 每位 = 启用勾选框 + 设备下拉 + 音量 + 实时延迟;
- *       另有"OBS 运行时自动开启"与"OBS 启动时自动打开本窗口"两个勾选框。
+ *       另有"OBS 运行时自动开启"与"OBS 启动时自动打开本窗口"两个勾选框;
+ *       v0.2.2 起增加"监听其他音频源(高级)"勾选框 + 音频源下拉
+ *       (默认关闭, 固定采集 OBS 默认桌面音频)。
  */
 #pragma once
 
@@ -38,6 +40,8 @@ private slots:
 	void onSlotVolumeChanged();
 	void onAutoStartToggled(bool checked);
 	void onAutoOpenToggled(bool checked);
+	void onCustomSourceToggled(bool checked);
+	void onCustomSourceChanged();
 	void onAddDesktopAudio();
 	void refreshAll();
 
@@ -45,6 +49,7 @@ private:
 	void applyNow();
 	void refreshStatus();
 	void rebuildDeviceCombos();
+	void rebuildSourceCombo(const QString &prefer = QString());
 	void loadSlotStates();
 	int slotIndexByWidget(QWidget *w) const;
 
@@ -58,8 +63,13 @@ private:
 
 	QVector<SlotRows> slots_;
 	QVector<MirrorDevice> last_devs_; /* 上次枚举到的设备(变化才重建下拉) */
+	QVector<AudioSourceInfo> last_srcs_; /* 上次枚举到的音频源(变化才重建下拉) */
 	QCheckBox *autoStartCheck_ = nullptr;
 	QCheckBox *autoOpenCheck_ = nullptr;
+	/* v0.2.2: 监听其他音频源(高级, 默认关闭) */
+	QCheckBox *customSourceCheck_ = nullptr;
+	QComboBox *customSourceCombo_ = nullptr;
+	QLabel *captureSourceLabel_ = nullptr;
 	QLabel *statusLabel_ = nullptr;
 	QPushButton *addDesktopBtn_ = nullptr;
 	QTimer *statusTimer_ = nullptr;

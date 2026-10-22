@@ -10,6 +10,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QFont>
 #include <QLabel>
 #include <QPushButton>
 #include <QSlider>
@@ -106,13 +107,38 @@ MirrorWindow::MirrorWindow(QWidget *parent) : QDialog(parent)
 		obs_module_text("AudioMirror.Window.AutoOpenTip")));
 	layout->addWidget(autoOpenCheck_);
 
+	/* ---- 监听其他音频源(高级, 默认关闭) ---- */
+	customSourceCheck_ = new QCheckBox(
+		QString::fromUtf8(
+			obs_module_text("AudioMirror.Window.CustomSource")),
+		this);
+	customSourceCheck_->setToolTip(QString::fromUtf8(
+		obs_module_text("AudioMirror.Window.CustomSourceTip")));
+	layout->addWidget(customSourceCheck_);
+
+	customSourceCombo_ = new QComboBox(this);
+	customSourceCombo_->setMinimumWidth(220);
+	customSourceCombo_->setEnabled(false); /* 仅勾选时可用 */
+	layout->addWidget(customSourceCombo_);
+
+	/* 当前采集源描述(小字灰色, 未监听时隐藏) */
+	captureSourceLabel_ = new QLabel(this);
+	captureSourceLabel_->setWordWrap(true);
+	captureSourceLabel_->setStyleSheet(QStringLiteral("color:gray;"));
+	{
+		QFont f = captureSourceLabel_->font();
+		f.setPointSize(qMax(f.pointSize() - 1, 7));
+		captureSourceLabel_->setFont(f);
+	}
+	layout->addWidget(captureSourceLabel_);
+
 	/* ---- 桌面音频源缺失时的补救按钮 ---- */
 	addDesktopBtn_ = new QPushButton(
 		QString::fromUtf8(
 			obs_module_text("AudioMirror.Window.AddSource")),
 		this);
 	addDesktopBtn_->setToolTip(QString::fromUtf8(
-		"OBS 里没有采集系统声音的源, 点此自动创建一个并加入当前场景"));
+		"OBS 里没有采集系统声音的源, 点此自动创建一个（不加入任何场景）"));
 	addDesktopBtn_->setVisible(false);
 	layout->addWidget(addDesktopBtn_);
 
@@ -135,6 +161,11 @@ MirrorWindow::MirrorWindow(QWidget *parent) : QDialog(parent)
 		&MirrorWindow::onAutoStartToggled);
 	connect(autoOpenCheck_, &QCheckBox::toggled, this,
 		&MirrorWindow::onAutoOpenToggled);
+	connect(customSourceCheck_, &QCheckBox::toggled, this,
+		&MirrorWindow::onCustomSourceToggled);
+	connect(customSourceCombo_,
+		QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+		&MirrorWindow::onCustomSourceChanged);
 	connect(addDesktopBtn_, &QPushButton::clicked, this,
 		&MirrorWindow::onAddDesktopAudio);
 
@@ -155,6 +186,16 @@ MirrorWindow::MirrorWindow(QWidget *parent) : QDialog(parent)
 		autoStartCheck_->setChecked(mirror::cfgAutoStart());
 		const QSignalBlocker b2(autoOpenCheck_);
 		autoOpenCheck_->setChecked(mirror::cfgAutoOpen());
+	}
+
+	{
+		/* 监听其他音频源(高级): 默认关闭; 勾选时才恢复上次选的源 */
+		const QSignalBlocker b1(customSourceCheck_);
+		customSourceCheck_->setChecked(mirror::cfgUseCustomSource());
+		const QSignalBlocker b2(customSourceCombo_);
+		rebuildSourceCombo(mirror::cfgCustomSourceName());
+		customSourceCombo_->setEnabled(
+			customSourceCheck_->isChecked());
 	}
 
 	refreshStatus();
@@ -265,6 +306,32 @@ void MirrorWindow::rebuildDeviceCombos()
 	}
 }
 
+/* 重建"监听其他音频源"下拉: 项来自 enumAudioSources()
+ * (display = 源名 · 类型描述, data = 源名)。
+ * prefer 非空 = 优先选中该源(首次构造时恢复配置); 为空 = 保留当前选择。 */
+void MirrorWindow::rebuildSourceCombo(const QString &prefer)
+{
+	const auto srcs = mirror::enumAudioSources();
+	const QString keep = prefer.isEmpty()
+				     ? customSourceCombo_->currentData()
+					       .toString()
+				     : prefer;
+
+	const QSignalBlocker b(customSourceCombo_);
+	customSourceCombo_->clear();
+	for (const auto &s : srcs) {
+		customSourceCombo_->addItem(
+			s.name + QStringLiteral(" · ") + s.typeDesc, s.name);
+	}
+
+	/* 恢复选择; 指定的源已不存在则回到第一项(排序后默认桌面音频在前) */
+	int sel = keep.isEmpty() ? 0 : customSourceCombo_->findData(keep);
+	if (sel < 0)
+		sel = 0;
+	if (customSourceCombo_->count() > 0)
+		customSourceCombo_->setCurrentIndex(sel);
+}
+
 void MirrorWindow::applyNow()
 {
 	/* 收集启用的位 */
@@ -277,7 +344,14 @@ void MirrorWindow::applyNow()
 			ids.append(dev);
 	}
 
-	const QString err = mirror::applySelection(ids);
+	/* 高级功能: 勾选"监听其他音频源"且下拉选中了源 -> 采集指定源;
+	 * 否则走默认路径(固定 OBS 默认桌面音频)。 */
+	QString sourceName;
+	if (customSourceCheck_->isChecked()) {
+		sourceName = customSourceCombo_->currentData().toString();
+	}
+
+	const QString err = mirror::applySelection(ids, sourceName);
 	if (!err.isEmpty()) {
 		statusLabel_->setText(
 			QString::fromUtf8(
@@ -298,6 +372,11 @@ void MirrorWindow::applyNow()
 		cfg.append(ms);
 	}
 	mirror::cfgSetSlots(cfg);
+
+	/* 持久化: 自定义采集源开关与选择 */
+	mirror::cfgSetUseCustomSource(customSourceCheck_->isChecked());
+	mirror::cfgSetCustomSourceName(
+		customSourceCombo_->currentData().toString());
 }
 
 void MirrorWindow::refreshStatus()
@@ -305,6 +384,19 @@ void MirrorWindow::refreshStatus()
 	/* 桌面音频源缺失 -> 显示补救按钮 */
 	const bool hasSource = mirror::ensureDesktopAudioSource(false);
 	addDesktopBtn_->setVisible(!hasSource);
+
+	/* 当前采集源描述(小字灰色; 未在监听时隐藏) */
+	const QString capDesc = mirror::captureSourceDesc();
+	if (capDesc.isEmpty()) {
+		captureSourceLabel_->hide();
+	} else {
+		captureSourceLabel_->setText(
+			QString::fromUtf8(
+				obs_module_text(
+					"AudioMirror.Window.Status.CaptureSource"))
+				.arg(capDesc));
+		captureSourceLabel_->show();
+	}
 
 	/* 状态摘要 */
 	int enabledCount = 0;
@@ -318,8 +410,8 @@ void MirrorWindow::refreshStatus()
 	}
 
 	if (mirror::isActive()) {
-		/* 有启用位超过 2 秒收不到音频包 = 桌面音频源没在产出
-		 * (不在当前场景/被移除/采集失败), 提示用户去排查。 */
+		/* 有启用位超过 2 秒收不到音频包 = 采集源没在产出
+		 * (源被删除/采集失败/目标应用未运行), 提示用户去排查。 */
 		bool stalled = false;
 		for (const auto &s : slots_) {
 			const QString dev = s.device->currentData().toString();
@@ -396,6 +488,26 @@ void MirrorWindow::refreshAll()
 		rebuildDeviceCombos();
 	}
 
+	/* 用户在 OBS 里增删音频源: 列表变了才重建"监听其他音频源"下拉 */
+	const auto srcs = mirror::enumAudioSources();
+	bool srcsSame = srcs.size() == last_srcs_.size();
+	if (srcsSame) {
+		for (int i = 0; i < srcs.size(); ++i) {
+			if (srcs[i].name != last_srcs_[i].name ||
+			    srcs[i].typeId != last_srcs_[i].typeId ||
+			    srcs[i].deviceId != last_srcs_[i].deviceId ||
+			    srcs[i].isDefaultDesktop !=
+				    last_srcs_[i].isDefaultDesktop) {
+				srcsSame = false;
+				break;
+			}
+		}
+	}
+	if (!srcsSame) {
+		last_srcs_ = srcs;
+		rebuildSourceCombo();
+	}
+
 	refreshStatus();
 }
 
@@ -460,6 +572,22 @@ void MirrorWindow::onAutoStartToggled(bool checked)
 void MirrorWindow::onAutoOpenToggled(bool checked)
 {
 	mirror::cfgSetAutoOpen(checked);
+}
+
+void MirrorWindow::onCustomSourceToggled(bool checked)
+{
+	/* 源下拉仅勾选时可用 */
+	customSourceCombo_->setEnabled(checked);
+	/* 切换采集源立即生效(并持久化) */
+	applyNow();
+}
+
+void MirrorWindow::onCustomSourceChanged()
+{
+	/* 未勾选时改动不生效(下拉本就被禁用, 防程序性触发) */
+	if (!customSourceCheck_->isChecked())
+		return;
+	applyNow();
 }
 
 void MirrorWindow::onAddDesktopAudio()

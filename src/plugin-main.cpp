@@ -9,7 +9,11 @@
  *   - OBS 启动完成 -> 确保有"桌面音频"采集源 -> 按 5 个监听位的
  *     勾选状态自动开始(自动开启勾选时) -> 面板自动弹出(自动打开勾选时)
  *   - 工具菜单点击 -> 弹出/置顶面板
- *   - 切场景后重新保障桌面音频源(OBS 音频源只在所在场景激活时才产出)
+ *
+ * v0.2.2 起:
+ *   - 默认固定采集 OBS 默认桌面音频(device_id="default" 的环回源),
+ *     采集与场景/激活无关, 不再监听切场景事件;
+ *   - "监听其他音频源"是可选高级功能(默认关闭), 勾选后采集指定源。
  */
 #include "plugin-main.hpp"
 #include "mirror-core.hpp"
@@ -63,6 +67,29 @@ static QStringList enabledDeviceIds()
 	return ids;
 }
 
+/* 高级功能"监听其他音频源": 勾选时才传采集源名, 否则走默认路径
+ * (固定 OBS 默认桌面音频)。 */
+static QString customSourceName()
+{
+	if (!mirror::cfgUseCustomSource())
+		return QString();
+	const QString name = mirror::cfgCustomSourceName();
+	if (name.isEmpty())
+		return QString();
+	/* 配置的源可能已被删除(如 OBS 关闭期间删的): 校验存在性,
+	 * 不存在则回退默认桌面音频 —— 与面板路径的静默降级行为一致,
+	 * 避免重启后自动开启/热键以"找不到音频源"失败且无明确原因。 */
+	const auto srcs = mirror::enumAudioSources();
+	for (const auto &s : srcs) {
+		if (s.name == name)
+			return name;
+	}
+	blog(LOG_WARNING,
+	     "[AudioMirror] 配置的音频源「%s」不存在, 回退默认桌面音频",
+	     qUtf8Printable(name));
+	return QString();
+}
+
 static void toggle_all()
 {
 	if (mirror::isActive()) {
@@ -72,7 +99,7 @@ static void toggle_all()
 	const QStringList ids = enabledDeviceIds();
 	if (ids.isEmpty())
 		return;
-	const QString err = mirror::applySelection(ids);
+	const QString err = mirror::applySelection(ids, customSourceName());
 	if (!err.isEmpty())
 		blog(LOG_WARNING, "[AudioMirror] start failed: %s",
 		     qUtf8Printable(err));
@@ -93,7 +120,8 @@ static void frontend_event(enum obs_frontend_event event, void *)
 		/* 傻瓜版: OBS 一开就把该做的自动做完。
 		 * 1) 确保有源在采系统声音(没有就自动创建);
 		 * 2) 勾了"自动打开" -> 弹出面板;
-		 * 3) 勾了"自动开启"且有启用的监听位 -> 直接开始监听。 */
+		 * 3) 勾了"自动开启"且有启用的监听位 -> 直接开始监听
+		 *    ("监听其他音频源"勾选时采集配置里指定的源)。 */
 		mirror::ensureDesktopAudioSource(true);
 
 		if (mirror::cfgAutoOpen()) {
@@ -105,15 +133,16 @@ static void frontend_event(enum obs_frontend_event event, void *)
 		if (mirror::cfgAutoStart()) {
 			const QStringList ids = enabledDeviceIds();
 			if (!ids.isEmpty()) {
+				const QString srcName = customSourceName();
 				blog(LOG_INFO,
 				     "[AudioMirror] auto start: %d device(s)",
 				     (int)ids.size());
 				QMetaObject::invokeMethod(
 					qApp,
-					[ids] {
+					[ids, srcName] {
 						const QString err =
 							mirror::applySelection(
-								ids);
+								ids, srcName);
 						if (!err.isEmpty())
 							blog(LOG_WARNING,
 							     "[AudioMirror] auto start failed: %s",
@@ -122,10 +151,6 @@ static void frontend_event(enum obs_frontend_event event, void *)
 					Qt::QueuedConnection);
 			}
 		}
-	} else if (event == OBS_FRONTEND_EVENT_SCENE_CHANGED) {
-		/* 切场景: OBS 的音频源只在所在场景激活时才产出音频,
-		 * 重新保障一次, 采集不会断。 */
-		mirror::ensureDesktopAudioSource(false);
 	} else if (event == OBS_FRONTEND_EVENT_EXIT ||
 		   event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN) {
 		/* OBS 开始关闭: 立刻停止全部监听并释放 WASAPI。
@@ -152,7 +177,7 @@ bool obs_module_load(void)
 				     show_window);
 	}
 
-	/* 事件回调: 启动自动开始 / 切场景保障 / 退出清理 */
+	/* 事件回调: 启动自动开始 / 退出清理 */
 	obs_frontend_add_event_callback(frontend_event, nullptr);
 
 	/* 全局热键: 一键开始/停止全部 */

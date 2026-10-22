@@ -599,6 +599,11 @@ std::vector<std::unique_ptr<WasapiRenderer>> g_renderers;
 /* 采集回调的目标源。持有引用: 防止监听中源被删导致悬垂指针,
  * 也保证 remove 时源一定还活着。 */
 obs_source_t *g_cap_source = nullptr;
+/* 自建的桌面音频采集源(obs_source_create 返回带 1 个引用的源, 没有
+ * 场景持有它时一 release 就会立刻销毁, 故常驻持有)。
+ * 生命周期 = 插件生命周期: stopAll() 与模块卸载时 release 并置空。
+ * 值为空表示尚未自建过(或已释放, 下次需要时会重新自建)。 */
+obs_source_t *g_own_source = nullptr;
 /* 采集源的音频格式(所有渲染器共用)与"身份戳"(源名+设备),
  * 变了就要按新格式重建全部重采样器。 */
 struct resample_info g_src_info{};
@@ -639,9 +644,13 @@ bool is_loopback_id(const char *id)
 	return id && strcmp(id, "wasapi_output_capture") == 0;
 }
 
-/* 找优先级最高的桌面音频源。
+/* 找 OBS 默认的桌面音频源 = 设备为系统默认播放设备的环回采集源。
+ * 只认 id == "wasapi_output_capture" 且 settings 的 device_id 为
+ * "default"(大小写不敏感)或空的源; 进程采集源
+ * (wasapi_process_output_capture) 从机制上被排除 —— 目标应用没开时
+ * 开局即 "Device '' failed to start", 挂上去只会零音频。
+ * 有多个时取枚举顺序的第一个。
  * 返回持有引用的 obs_source_t*(调用方负责 release), 找不到返回 null。
- * 优先级: ① 默认设备的环回 ② 任意环回 ③ 应用音频。
  * 注意: obs_enum_all_sources 枚举期间只持 sources_mutex 且不持引用,
  * 因此枚举回调里只取引用, 读源设置(持源自己的锁)放到枚举结束后做,
  * 避免任何锁序风险。 */
@@ -654,34 +663,31 @@ obs_source_t *find_desktop_audio_source()
 	obs_enum_all_sources(
 		[](void *param, obs_source_t *src) {
 			auto *c = static_cast<Ctx *>(param);
-			if (is_desktop_audio_id(obs_source_get_id(src)))
+			if (is_loopback_id(obs_source_get_id(src)))
 				c->candidates.push_back(obs_source_get_ref(src));
 			return true;
 		},
 		&ctx);
 
-	obs_source_t *best = nullptr;
-	int best_rank = 99;
+	/* 枚举结束后再读 settings: 只保留 device_id 为 "default"/空的,
+	 * 取其中第一个(移交引用), 其余释放。 */
+	obs_source_t *found = nullptr;
 	for (obs_source_t *src : ctx.candidates) {
-		int rank = is_loopback_id(obs_source_get_id(src)) ? 2 : 3;
-		if (rank == 2) {
-			obs_data_t *s = obs_source_get_settings(src);
-			const char *dev =
-				s ? obs_data_get_string(s, "device_id") : nullptr;
-			if (dev && _stricmp(dev, "default") == 0)
-				rank = 1;
-			if (s)
-				obs_data_release(s);
+		bool is_default = false;
+		obs_data_t *s = obs_source_get_settings(src);
+		if (s) {
+			const char *dev = obs_data_get_string(s, "device_id");
+			is_default = !dev || !*dev ||
+				     _stricmp(dev, "default") == 0;
+			obs_data_release(s);
 		}
-		if (rank < best_rank) {
-			if (best)
-				obs_source_release(best);
-			best = src; /* 移交引用 */
+		if (is_default && !found) {
+			found = src; /* 移交引用 */
 		} else {
 			obs_source_release(src);
 		}
 	}
-	return best; /* 调用方负责 release */
+	return found; /* 调用方负责 release */
 }
 
 /* 取桌面音频源的音频格式。
@@ -772,89 +778,38 @@ bool query_source_format(obs_source_t *source, struct resample_info &out,
 	return ok;
 }
 
-/* 保障桌面音频采集源(详见头文件注释) */
+/* 保障默认桌面音频采集源存在(详见头文件注释)。
+ * v0.2.2 起不再把源加进任何场景: win-wasapi.cpp 构造函数末尾直接
+ * Start(), 采集线程从源创建就开始, 与场景/激活无关; obs-source.c
+ * 的 source_signal_audio_data 音频采集回调也无激活/静音门控。
+ * 自建源常驻持有引用(g_own_source), 防止没有场景持有时被回收。 */
 bool ensure_desktop_audio_source(bool create_if_missing)
 {
-	struct Ctx {
-		bool has_active = false;
-		obs_source_t *any = nullptr; /* 持有引用的第一个环回源 */
-	} ctx;
+	/* 已自建过: 复用(引用常驻, 源一定还活着) */
+	if (g_own_source)
+		return true;
 
-	obs_enum_all_sources(
-		[](void *param, obs_source_t *src) {
-			auto *c = static_cast<Ctx *>(param);
-			if (!is_loopback_id(obs_source_get_id(src)))
-				return true;
-			if (obs_source_active(src)) {
-				c->has_active = true;
-				return false; /* 找到即止 */
-			}
-			if (!c->any)
-				c->any = obs_source_get_ref(src);
-			return true;
-		},
-		&ctx);
-
-	if (ctx.has_active) {
-		if (ctx.any)
-			obs_source_release(ctx.any);
+	/* 已有默认桌面音频源(device_id 为 "default"/空的环回源) */
+	obs_source_t *found = find_desktop_audio_source();
+	if (found) {
+		obs_source_release(found);
 		return true;
 	}
 
-	obs_source_t *to_add = ctx.any;
-	if (!to_add) {
-		if (!create_if_missing)
-			return false;
-		to_add = obs_source_create("wasapi_output_capture",
-					   "AudioMirror 桌面音频", nullptr,
-					   nullptr);
-		if (!to_add) {
-			AM_LOG(LOG_ERROR, "桌面音频保障: 源创建失败");
-			return false;
-		}
+	if (!create_if_missing)
+		return false;
+
+	/* 自建: nullptr settings 时 get_defaults 给 device_id="default"。
+	 * 刻意不加入任何场景(采集与场景无关, 不污染用户场景)。 */
+	g_own_source = obs_source_create("wasapi_output_capture",
+					 "AudioMirror 桌面音频", nullptr,
+					 nullptr);
+	if (!g_own_source) {
+		AM_LOG(LOG_ERROR, "桌面音频保障: 源创建失败");
+		return false;
 	}
-
-	/* 加进当前场景(OBS 的音频源只在所在场景激活时才产出音频)。
-	 * 先用 obs_sceneitem_get_source 精确判断是否已在场景里。 */
-	bool added = false;
-	obs_source_t *scene_source = obs_frontend_get_current_scene();
-	if (scene_source) {
-		obs_scene_t *scene = obs_scene_from_source(scene_source);
-		if (scene) {
-			struct PresentCtx {
-				obs_source_t *target;
-				bool present = false;
-			} pctx{to_add};
-
-			obs_scene_enum_items(
-				scene,
-				[](obs_scene_t *, obs_sceneitem_t *item,
-				   void *p) {
-					auto *pc = static_cast<PresentCtx *>(p);
-					if (obs_sceneitem_get_source(item) ==
-					    pc->target)
-						pc->present = true;
-					return true;
-				},
-				&pctx);
-
-			if (!pctx.present) {
-				/* obs_scene_add 内部自取引用 */
-				obs_scene_add(scene, to_add);
-				AM_LOG(LOG_INFO,
-				       "桌面音频保障: 已加入当前场景");
-			}
-			added = true;
-		} else {
-			AM_LOG(LOG_WARNING, "桌面音频保障: 当前源不是场景");
-		}
-		obs_source_release(scene_source);
-	} else {
-		AM_LOG(LOG_WARNING, "桌面音频保障: 拿不到当前场景");
-	}
-
-	obs_source_release(to_add);
-	return added;
+	AM_LOG(LOG_INFO, "桌面音频保障: 已自建采集源(不加入任何场景)");
+	return true;
 }
 
 /* 按 id 找运行中的渲染器; 调用方需持有 g_engine_mtx */
@@ -964,18 +919,49 @@ bool mirror::isActive()
 #endif
 }
 
-QString mirror::applySelection(const QStringList &deviceIds)
+QString mirror::applySelection(const QStringList &deviceIds,
+			       const QString &sourceName)
 {
 #ifdef _WIN32
-	/* 1. 保障桌面音频源(没有就自动创建) */
-	if (!ensure_desktop_audio_source(true))
-		return QStringLiteral(
-			"没有可用的桌面音频采集源，请在 OBS 里添加「桌面音频」");
+	obs_source_t *cap = nullptr;
 
-	/* 2. 找采集源并确定它的音频格式 */
-	obs_source_t *cap = find_desktop_audio_source();
-	if (!cap)
-		return QStringLiteral("找不到桌面音频采集源");
+	if (!sourceName.isEmpty()) {
+		/* 高级路径: 按名字找用户指定的音频源(必须是桌面音频类)。
+		 * 枚举纪律同 find_desktop_audio_source: 回调里只取引用,
+		 * 名字比较不涉及源锁。 */
+		const QByteArray want = sourceName.toUtf8();
+		struct Ctx {
+			obs_source_t *found = nullptr; /* 持有引用 */
+			const char *name = nullptr;
+		} ctx{nullptr, want.constData()};
+
+		obs_enum_all_sources(
+			[](void *param, obs_source_t *src) {
+				auto *c = static_cast<Ctx *>(param);
+				if (c->found)
+					return true;
+				if (!is_desktop_audio_id(obs_source_get_id(src)))
+					return true;
+				const char *name = obs_source_get_name(src);
+				if (name && strcmp(name, c->name) == 0)
+					c->found = obs_source_get_ref(src);
+				return true;
+			},
+			&ctx);
+
+		cap = ctx.found;
+		if (!cap)
+			return QStringLiteral("找不到音频源: ") + sourceName;
+	} else {
+		/* 默认路径: 固定 OBS 默认桌面音频(没有就自建) */
+		if (!ensure_desktop_audio_source(true))
+			return QStringLiteral(
+				"没有可用的桌面音频采集源，请在 OBS 里添加「桌面音频」");
+
+		cap = find_desktop_audio_source();
+		if (!cap)
+			return QStringLiteral("找不到桌面音频采集源");
+	}
 
 	struct resample_info src_info{};
 	QString resolved_id;
@@ -1093,6 +1079,7 @@ QString mirror::applySelection(const QStringList &deviceIds)
 	return {};
 #else
 	Q_UNUSED(deviceIds)
+	Q_UNUSED(sourceName)
 	return QStringLiteral("当前仅支持 Windows");
 #endif
 }
@@ -1170,9 +1157,113 @@ void mirror::stopAll()
 		obs_source_release(g_cap_source);
 		g_cap_source = nullptr;
 	}
+	/* 释放自建源的常驻引用: 回调已摘净, 引用归零即销毁
+	 * (没有场景持有它, 不会残留在用户场景里)。 */
+	if (g_own_source) {
+		obs_source_release(g_own_source);
+		g_own_source = nullptr;
+	}
 	g_has_src = false;
 	g_src_token.clear();
 	AM_LOG(LOG_INFO, "已停止全部监听");
+#endif
+}
+
+/* ================= 音频源枚举 / 诊断 ================= */
+
+QVector<AudioSourceInfo> mirror::enumAudioSources()
+{
+	QVector<AudioSourceInfo> out;
+#ifdef _WIN32
+	struct Ctx {
+		std::vector<obs_source_t *> sources; /* 持有引用 */
+	} ctx;
+
+	/* 枚举纪律同 find_desktop_audio_source: 回调里只取引用,
+	 * 名字/id/设置都放到枚举结束后读, 避免任何锁序风险。 */
+	obs_enum_all_sources(
+		[](void *param, obs_source_t *src) {
+			auto *c = static_cast<Ctx *>(param);
+			if (is_desktop_audio_id(obs_source_get_id(src)))
+				c->sources.push_back(obs_source_get_ref(src));
+			return true;
+		},
+		&ctx);
+
+	out.reserve(static_cast<int>(ctx.sources.size()));
+	for (obs_source_t *src : ctx.sources) {
+		const char *id = obs_source_get_id(src);
+
+		AudioSourceInfo info;
+		info.name = QString::fromUtf8(obs_source_get_name(src));
+		info.typeId = QString::fromUtf8(id);
+
+		/* device_id 先拷出来再释放 settings(指针指向其内部存储,
+		 * release 后即失效) */
+		QString devId;
+		obs_data_t *s = obs_source_get_settings(src);
+		if (s) {
+			const char *dev = obs_data_get_string(s, "device_id");
+			if (dev && *dev)
+				devId = QString::fromUtf8(dev);
+			obs_data_release(s);
+		}
+		const bool is_default_dev =
+			devId.isEmpty() ||
+			devId.compare(QLatin1String("default"),
+				      Qt::CaseInsensitive) == 0;
+
+		info.deviceId = devId.isEmpty() ? QStringLiteral("(默认)")
+						: devId;
+		info.typeDesc = is_loopback_id(id)
+					? QStringLiteral("桌面音频 (环回)")
+					: QStringLiteral("应用程序音频");
+		info.isDefaultDesktop = is_loopback_id(id) && is_default_dev;
+
+		out.append(info);
+		obs_source_release(src);
+	}
+
+	/* 默认桌面音频排最前, 其余按源名, 方便 UI 默认选中 */
+	std::stable_sort(out.begin(), out.end(),
+			 [](const AudioSourceInfo &a,
+			    const AudioSourceInfo &b) {
+				 if (a.isDefaultDesktop != b.isDefaultDesktop)
+					 return a.isDefaultDesktop;
+				 return a.name < b.name;
+			 });
+#endif
+	return out;
+}
+
+QString mirror::captureSourceDesc()
+{
+#ifdef _WIN32
+	/* g_engine_mtx 只被 UI 线程持有, 音频线程不碰; 持锁期间只做
+	 * 轻量读取(源名/id/settings), 无 AB-BA 死锁风险。 */
+	std::lock_guard<std::mutex> lk(g_engine_mtx);
+	obs_source_t *src = g_cap_source;
+	if (!src)
+		return {};
+
+	const QString name = QString::fromUtf8(obs_source_get_name(src));
+	const char *id = obs_source_get_id(src);
+	const QString typeDesc = is_loopback_id(id)
+					 ? QStringLiteral("桌面音频 (环回)")
+					 : QStringLiteral("应用程序音频");
+
+	QString devDesc = QStringLiteral("默认设备");
+	obs_data_t *s = obs_source_get_settings(src);
+	if (s) {
+		const char *dev = obs_data_get_string(s, "device_id");
+		if (dev && *dev && _stricmp(dev, "default") != 0)
+			devDesc = QString::fromUtf8(dev);
+		obs_data_release(s);
+	}
+	return name + QStringLiteral(" · ") + typeDesc +
+	       QStringLiteral(" · ") + devDesc;
+#else
+	return {};
 #endif
 }
 
@@ -1196,6 +1287,8 @@ static void cfg_init_defaults()
 	}
 	config_set_default_bool(c, CFG_SECTION, "AutoStart", true);
 	config_set_default_bool(c, CFG_SECTION, "AutoOpen", true);
+	config_set_default_bool(c, CFG_SECTION, "UseCustomSource", false);
+	config_set_default_string(c, CFG_SECTION, "CustomSourceName", "");
 }
 
 QVector<MirrorSlot> mirror::cfgSlots()
@@ -1291,6 +1384,44 @@ void mirror::cfgSetAutoOpen(bool v)
 	if (!c)
 		return;
 	config_set_bool(c, CFG_SECTION, "AutoOpen", v);
+	config_save_safe(c, "tmp", "bak");
+}
+
+bool mirror::cfgUseCustomSource()
+{
+	config_t *c = user_config();
+	if (!c)
+		return false;
+	cfg_init_defaults();
+	return config_get_bool(c, CFG_SECTION, "UseCustomSource");
+}
+
+void mirror::cfgSetUseCustomSource(bool v)
+{
+	config_t *c = user_config();
+	if (!c)
+		return;
+	config_set_bool(c, CFG_SECTION, "UseCustomSource", v);
+	config_save_safe(c, "tmp", "bak");
+}
+
+QString mirror::cfgCustomSourceName()
+{
+	config_t *c = user_config();
+	if (!c)
+		return {};
+	cfg_init_defaults();
+	return QString::fromUtf8(
+		config_get_string(c, CFG_SECTION, "CustomSourceName"));
+}
+
+void mirror::cfgSetCustomSourceName(const QString &name)
+{
+	config_t *c = user_config();
+	if (!c)
+		return;
+	config_set_string(c, CFG_SECTION, "CustomSourceName",
+			  name.toUtf8().constData());
 	config_save_safe(c, "tmp", "bak");
 }
 

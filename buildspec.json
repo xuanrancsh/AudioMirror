@@ -38,7 +38,7 @@
     },
     "name": "AudioMirror",
     "displayName": "音频多设备监听",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "website": "https://github.com/xuanrancsh/AudioMirror",
     "author": "xuanrancsh",
     "email": "audiomirror@example.com",

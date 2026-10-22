@@ -48,6 +48,16 @@ struct MirrorSlot {
 	double volume = 100.0;
 };
 
+/* 一个可监听的音频采集源(OBS 源, 桌面音频类) */
+struct AudioSourceInfo {
+	QString name;                  /* OBS 源名, 如 "桌面音频" */
+	QString typeId;                /* 源类型 id: wasapi_output_capture /
+					wasapi_process_output_capture */
+	QString deviceId;              /* settings 的 device_id, 空则 "(默认)" */
+	QString typeDesc;              /* 类型描述: "桌面音频 (环回)" / "应用程序音频" */
+	bool isDefaultDesktop = false; /* 默认桌面音频(环回 + 默认设备) */
+};
+
 namespace mirror {
 
 /* ---------- 设备枚举(UI 线程调用) ---------- */
@@ -60,8 +70,21 @@ bool isActive();
 
 /* 应用选择: 立即生效(新增的开路/取消的断路), 并持久化启用状态。
  * deviceIds: 需要监听的设备 ID 列表(<=5, 内部去重/剔除默认播放设备)。
+ * sourceName: 为空 = 固定采集 OBS 默认桌面音频(默认路径);
+ *             非空 = 采集指定名字的桌面音频类源("监听其他音频源"
+ *             高级功能勾选时由 UI 传入)。
  * 返回错误描述; 成功返回空串。 */
-QString applySelection(const QStringList &deviceIds);
+QString applySelection(const QStringList &deviceIds,
+		       const QString &sourceName = QString());
+
+/* 枚举 OBS 里所有桌面音频类源(环回 + 应用程序音频), 供
+ * "监听其他音频源(高级)"下拉选择。UI 线程调用。
+ * 排序: 默认桌面音频优先, 其余按源名。 */
+QVector<AudioSourceInfo> enumAudioSources();
+
+/* 当前采集源的描述串, 如 "桌面音频 · 桌面音频 (环回) · 默认设备";
+ * 未在监听(没有采集源)时返回空串。UI 用于诊断当前实际挂了哪个源。 */
+QString captureSourceDesc();
 
 /* 运行时改音量(0-200, 100 = 原始音量), 立即生效不落盘 */
 void setDeviceVolume(const QString &deviceId, double percent);
@@ -71,7 +94,7 @@ void setDeviceVolume(const QString &deviceId, double percent);
 double deviceLatencyMs(const QString &deviceId);
 
 /* 无音频输入诊断: 渲染器在运行, 但超过 2 秒没收到桌面音频包
- * (源不在当前场景/被移除/采集失败)。UI 用于在延迟位置给出
+ * (采集源被删除/采集失败/目标应用未运行等)。UI 用于在延迟位置给出
  * "无音频输入"提示, 避免把 0.0 ms 误显示成正常低延迟。
  * 注意: OBS 混音器里的静音/隐藏不算 —— 那只是显示状态, 采集
  * 数据仍照常转发。 */
@@ -96,16 +119,25 @@ void cfgSetAutoStart(bool v);
 bool cfgAutoOpen();                             /* 默认 true: OBS 启动时自动打开面板 */
 void cfgSetAutoOpen(bool v);
 
+/* 高级功能"监听其他音频源"开关: 默认 false(固定采集默认桌面音频)。
+ * 勾选时 applySelection 的 sourceName 传 cfgCustomSourceName()。 */
+bool cfgUseCustomSource();
+void cfgSetUseCustomSource(bool v);
+/* 高级功能选中的音频源名(默认空; 仅 cfgUseCustomSource() 为 true 时生效) */
+QString cfgCustomSourceName();
+void cfgSetCustomSourceName(const QString &name);
+
 /* ---------- 傻瓜版: 桌面音频保障 ---------- */
 
-/* 确保 OBS 里有源在采集"桌面音频(系统输出声音)":
- *   已有活跃的桌面音频源                -> true, 什么都不做;
- *   有但不活跃(在别的场景里)            -> 把它加进当前场景;
- *   没有 且 createIfMissing = true      -> 自动创建并加入当前场景;
- *   创建/添加失败                       -> false(UI 应提示手动添加)。
- * 说明: 本插件按源采集桌面音频; OBS 的音频源只在所在场景激活时才
- * 产出音频, 所以切场景后要重新保障(plugin-main 监听 SCENE_CHANGED)。
- * 此函数让"什么都不会"的用户装上就能响。 */
+/* 确保 OBS 里有源在采集"默认桌面音频(系统默认输出设备的环回)":
+ *   已有默认桌面音频源              -> true, 什么都不做;
+ *   没有 且 createIfMissing = true  -> 自建一个(常驻持有引用,
+ *                                      不加入任何场景);
+ *   没有 且 createIfMissing = false -> false(UI 应提示手动添加)。
+ * 说明: 采集与场景/激活无关 —— win-wasapi 采集源在构造函数末尾即
+ * Start() 采集线程(obs-source.c 的 source_signal_audio_data 音频回调
+ * 也无激活/静音门控), 因此本函数不把源加进任何场景, 不污染用户场景;
+ * 自建源的生命周期 = 插件生命周期(stopAll / 模块卸载时释放)。 */
 bool ensureDesktopAudioSource(bool createIfMissing);
 
 } // namespace mirror
