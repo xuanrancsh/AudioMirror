@@ -1,19 +1,28 @@
 /*
  * mirror-core.hpp - AudioMirror 插件核心
  *
- * 职责: 把 OBS 主混音(音轨 1-6)的成品音频同时、低延迟地输出到
- *       多个 WASAPI 渲染设备。
+ * 职责: 把 OBS 的"桌面音频"(电脑输出的所有声音, 不含麦克风)
+ *       同时、低延迟地输出到多个 WASAPI 渲染设备。
  *
- * 数据通路:
- *   OBS 主混音(mix N) --obs_add_raw_audio_callback(每设备一次注册)-->
- *     每设备独立重采样成该设备的 mix format(libobs 负责) -->
- *     本插件做最后一次 float -> 设备位深转换 + 自适应积压控制写出
+ * 数据通路(v0.2.0 起改为按源采集, 不再订阅主混音):
+ *   OBS 桌面音频源(wasapi_output_capture 环回采集)
+ *     --obs_source_add_audio_capture_callback(每设备注册一次)-->
+ *     每设备独立 libobs 重采样(源格式 -> 该设备 mix format, float)
+ *     -> 平面转交错 -> 本插件做最后一次 float -> 设备位深转换
+ *     -> WASAPI shared mode + 自适应积压控制写出
+ *
+ * 为什么按源采集而不是订阅主混音:
+ *   - 主混音里混着麦克风; 按源采集只订桌面音频类源
+ *     (wasapi_output_capture / wasapi_process_output_capture),
+ *     麦克风源(wasapi_input_capture)从机制上被排除,
+ *     用户不需要去关 OBS 的麦克风。
+ *   - 不碰 OBS 混音器/音轨/监听设备设置。
  *
  * 与 OBS 内置监听的差异(为什么要这个插件):
- *   - OBS 的"高级音频属性 -> 监听设备"每条混音只能选一个设备;
+ *   - OBS 的"高级音频属性 -> 监听设备"只能选一个设备;
  *   - OBS 监听走它自己的 audio_output 管道, 缓冲大且有时钟漂移,
  *     论坛有大量"越跑越延迟"的投诉(obsproject#3664);
- *   - 本插件直采混音输出, 自管 WASAPI 渲染 + 自适应积压控制,
+ *   - 本插件自管 WASAPI 渲染 + 自适应积压控制,
  *     把每路延迟钉在一个音频块的量级, 且不会随时间累积。
  */
 #pragma once
@@ -32,6 +41,13 @@ struct MirrorDevice {
 	bool isDefault = false; /* 当前系统默认播放设备: 声音已在此播放, 选它只会加倍音量 */
 };
 
+/* 一个监听位(固定 5 个): 启用开关 + 目标设备 + 音量 */
+struct MirrorSlot {
+	bool enabled = false;
+	QString device;
+	double volume = 100.0;
+};
+
 namespace mirror {
 
 /* ---------- 设备枚举(UI 线程调用) ---------- */
@@ -42,12 +58,12 @@ QVector<MirrorDevice> enumDevices();
 /* 是否有设备正在监听 */
 bool isActive();
 
-/* 应用勾选: 立即生效(新增的开路/取消的断路), 并持久化。
- * track: 订阅的音轨 1-6(1 = 主混音成品)。
+/* 应用选择: 立即生效(新增的开路/取消的断路), 并持久化启用状态。
+ * deviceIds: 需要监听的设备 ID 列表(<=5, 内部去重/剔除默认播放设备)。
  * 返回错误描述; 成功返回空串。 */
-QString applySelection(const QStringList &deviceIds, int track);
+QString applySelection(const QStringList &deviceIds);
 
-/* 运行时改音量(0-200, 100 = 与 OBS 主混音一致), 立即生效不落盘 */
+/* 运行时改音量(0-200, 100 = 原始音量), 立即生效不落盘 */
 void setDeviceVolume(const QString &deviceId, double percent);
 
 /* 每设备当前积压(毫秒)= 该路实际监听延迟; 未运行返回 -1。
@@ -62,24 +78,25 @@ QString deviceFormat(const QString &deviceId);
 void stopAll();
 
 /* ---------- 配置持久化(OBS user config, 段 "AudioMirror") ---------- */
-QStringList cfgDevices();                            /* 默认空 */
-void cfgSetDevices(const QStringList &ids);
-double cfgDeviceVolume(const QString &id);           /* 默认 100 */
+QVector<MirrorSlot> cfgSlots();                 /* 固定 5 个, 默认全关 */
+void cfgSetSlots(const QVector<MirrorSlot> &slots);
+double cfgDeviceVolume(const QString &id);      /* 按设备 ID, 默认 100 */
 void cfgSetDeviceVolume(const QString &id, double percent);
-int cfgTrack();                                      /* 默认 1 */
-void cfgSetTrack(int track);
-bool cfgAutoStart();                                 /* 默认 true */
+bool cfgAutoStart();                            /* 默认 true: OBS 运行时自动开启 */
 void cfgSetAutoStart(bool v);
+bool cfgAutoOpen();                             /* 默认 true: OBS 启动时自动打开面板 */
+void cfgSetAutoOpen(bool v);
 
 /* ---------- 傻瓜版: 桌面音频保障 ---------- */
 
-/* 确保 OBS 里有源在采集"系统输出声音"(桌面音频):
- *   已有在采的桌面音频源           -> true, 什么都不做;
- *   没有 且 createIfMissing = true -> 自动创建并加入当前场景;
- *   创建失败                       -> false(UI 应提示手动添加)。
- * 说明: 本插件订阅的是 OBS 混音输出; 若用户的 OBS 里没有任何
- * 音频源, 混音就是静音, 监听不到任何声音。此函数让"什么都不会"
- * 的用户装上就能响。 */
+/* 确保 OBS 里有源在采集"桌面音频(系统输出声音)":
+ *   已有活跃的桌面音频源                -> true, 什么都不做;
+ *   有但不活跃(在别的场景里)            -> 把它加进当前场景;
+ *   没有 且 createIfMissing = true      -> 自动创建并加入当前场景;
+ *   创建/添加失败                       -> false(UI 应提示手动添加)。
+ * 说明: 本插件按源采集桌面音频; OBS 的音频源只在所在场景激活时才
+ * 产出音频, 所以切场景后要重新保障(plugin-main 监听 SCENE_CHANGED)。
+ * 此函数让"什么都不会"的用户装上就能响。 */
 bool ensureDesktopAudioSource(bool createIfMissing);
 
 } // namespace mirror

@@ -47,8 +47,8 @@ target_sources(
     src/plugin-main.hpp
     src/mirror-core.cpp
     src/mirror-core.hpp
-    src/mirror-dock.cpp
-    src/mirror-dock.hpp
+    src/mirror-window.cpp
+    src/mirror-window.hpp
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
