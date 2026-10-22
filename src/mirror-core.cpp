@@ -510,6 +510,8 @@ WasapiRenderer *findRenderer(const QString &id)
 	return nullptr;
 }
 
+#endif /* _WIN32 */
+
 } // namespace
 
 /* ================= 设备枚举 ================= */
@@ -745,13 +747,27 @@ void mirror::stopAll()
 
 /* ================= 配置持久化 ================= */
 
+/* OBS 31 起 config_get_* 不再接受默认值参数, 改用
+ * config_set_default_* 注册默认值(重复注册无害)。
+ * 每次读配置前先把默认值补上, 保证首次运行有合理默认。 */
+static void cfg_init_defaults()
+{
+	config_t *c = user_config();
+	if (!c)
+		return;
+	config_set_default_string(c, CFG_SECTION, "Devices", "");
+	config_set_default_int(c, CFG_SECTION, "Track", 1);
+	config_set_default_bool(c, CFG_SECTION, "AutoStart", true);
+}
+
 QStringList mirror::cfgDevices()
 {
 	config_t *c = user_config();
 	if (!c)
 		return {};
+	cfg_init_defaults();
 	const QString raw = QString::fromUtf8(
-		config_get_string(c, CFG_SECTION, "Devices", ""));
+		config_get_string(c, CFG_SECTION, "Devices"));
 	if (raw.isEmpty())
 		return {};
 	return raw.split(QChar('\n'), Qt::SkipEmptyParts);
@@ -773,7 +789,8 @@ double mirror::cfgDeviceVolume(const QString &id)
 	if (!c)
 		return 100.0;
 	const QByteArray key = ("Vol." + id).toUtf8();
-	return config_get_double(c, CFG_SECTION, key.constData(), 100.0);
+	config_set_default_double(c, CFG_SECTION, key.constData(), 100.0);
+	return config_get_double(c, CFG_SECTION, key.constData());
 }
 
 void mirror::cfgSetDeviceVolume(const QString &id, double percent)
@@ -791,7 +808,8 @@ int mirror::cfgTrack()
 	config_t *c = user_config();
 	if (!c)
 		return 1;
-	int t = (int)config_get_int(c, CFG_SECTION, "Track", 1);
+	cfg_init_defaults();
+	int t = (int)config_get_int(c, CFG_SECTION, "Track");
 	if (t < 1)
 		t = 1;
 	if ((size_t)t > MAX_AUDIO_MIXES)
@@ -813,7 +831,8 @@ bool mirror::cfgAutoStart()
 	config_t *c = user_config();
 	if (!c)
 		return true;
-	return config_get_bool(c, CFG_SECTION, "AutoStart", true);
+	cfg_init_defaults();
+	return config_get_bool(c, CFG_SECTION, "AutoStart");
 }
 
 void mirror::cfgSetAutoStart(bool v)
