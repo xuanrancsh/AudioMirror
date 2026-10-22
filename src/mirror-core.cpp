@@ -16,7 +16,12 @@
  *        隐藏/音量变化: 那三者只影响 OBS 自己的混音与监听, 采集数据
  *        仍是真实音频), win-wasapi 采集源的格式 = 所采设备的 mix format。
  *   2. 重采样: 每设备一个 libobs audio_resampler_t
- *      (源格式 -> 该设备 mix format, float), 平面 -> 交错。
+ *      (源格式 -> 该设备 mix format)。src/dst 的 format 必须都是
+ *      AUDIO_FORMAT_FLOAT_PLANAR: libobs 回调数据是平面 float,
+ *      且 audio_resampler_resample 只回填 output_planes 个 output
+ *      指针(平面=全声道, 交错=仅 1 个) —— 填交错会让 planes[1..]
+ *      为 NULL, 交错循环空指针解引用崩掉 OBS。平面 -> 交错在本插件
+ *      的 writeCaptured 里做。
  *   3. 输出: WASAPI shared mode, 严格按 GetMixFormat() 的格式;
  *      100ms 缓冲只作抖动余量, 实际延迟由"自适应积压控制"钉在
  *      一个 OBS 音频块的量级(~21ms @48kHz), 设备时钟漂移每次
@@ -124,11 +129,19 @@ enum speaker_layout layout_from_channels(UINT32 n)
 		return SPEAKERS_2POINT1;
 	case 4:
 		return SPEAKERS_4POINT0;
+	case 5:
+		/* 5ch(FL FR FC LFE SL/BR 类): OBS 无 5.0 布局,
+		 * 映射到 4POINT1(同为 5 声道) —— 落 default 的
+		 * STEREO 会让 output_planes(2) < channels_(5),
+		 * planes[2..4] 为 NULL, 被防御全量丢包(设备静音)。 */
+		return SPEAKERS_4POINT1;
 	case 6:
 		return SPEAKERS_5POINT1;
 	case 8:
 		return SPEAKERS_7POINT1;
 	default:
+		/* 7ch 无标准布局(7.1 是 8ch): 落 STEREO 会被防御
+		 * 拦截为静默丢包 + ERROR 日志, 好过崩溃。 */
 		return SPEAKERS_STEREO;
 	}
 }
@@ -328,12 +341,16 @@ bool WasapiRenderer::start(const struct resample_info &src)
 		return false;
 	}
 
-	/* 建重采样器: 桌面音频源格式 -> 本设备 mix format(float)。
-	 * audio_resampler_resample 内部自管输出缓冲, 我们只做最后一次
-	 * float -> 设备位深。 */
+	/* 建重采样器: 桌面音频源格式 -> 本设备 mix format。
+	 * 必须用 FLOAT_PLANAR(平面): libobs 的回调数据是平面 float,
+	 * 且 audio_resampler_resample 只回填 output_planes 个指针
+	 * (= 平面格式的声道数; 若误填交错的 AUDIO_FORMAT_FLOAT,
+	 * output_planes=1, planes[1..] 全是 NULL, 交错循环直接
+	 * 空指针解引用崩掉整个 OBS —— v0.2.2 实崩, 见 2026-10-23
+	 * 崩溃日志 writeCaptured+0x275)。 */
 	dst_info_ = {};
 	dst_info_.samples_per_sec = sample_rate_;
-	dst_info_.format = AUDIO_FORMAT_FLOAT;
+	dst_info_.format = AUDIO_FORMAT_FLOAT_PLANAR;
 	dst_info_.speakers = layout_from_channels(channels_);
 
 	if (resampler_)
@@ -549,6 +566,24 @@ void WasapiRenderer::writeCaptured(const struct audio_data *audio)
 		return;
 	if (out_frames == 0 || !planes[0])
 		return;
+	/* 防御: audio_resampler_resample 只回填 output_planes 个指针
+	 * (平面格式 = 全部声道)。若 dst_info_ 的 format 被误填成交错
+	 * 格式, output_planes=1, planes[1..] 为 NULL —— 下面交错循环
+	 * 会空指针解引用(c0000005), 直接崩掉整个 OBS。这里显式拦截:
+	 * 丢包 + 报错, 保住 OBS。日志限流: 正常永不触发, 异常时也不
+	 * 要 10ms 一条刷爆日志(仿 on_source_audio 的一次性警告)。 */
+	static std::atomic<uint32_t> dropped{0};
+	const uint32_t n = dropped.fetch_add(1, std::memory_order_relaxed);
+	if (n < 5) {
+		AM_LOG(LOG_ERROR,
+		       "重采样输出声道不足(%u/%u), 丢弃本包 —— "
+		       "请检查 dst_info_.format 应为 "
+		       "AUDIO_FORMAT_FLOAT_PLANAR",
+		       c, channels_);
+	} else if (n == 5) {
+		AM_LOG(LOG_ERROR, "重采样输出声道不足: 后续丢包不再刷屏");
+	}
+	return;
 
 	/* 2) 平面 -> 交错 */
 	const size_t need = (size_t)out_frames * channels_;
@@ -748,10 +783,12 @@ bool query_source_format(obs_source_t *source, struct resample_info &out,
 				WAVEFORMATEX *wfex = nullptr;
 				if (SUCCEEDED(client->GetMixFormat(&wfex)) &&
 				    wfex) {
-					out.samples_per_sec = wfex->nSamplesPerSec;
+					out.samples_per_sec =
+						wfex->nSamplesPerSec;
 					out.speakers = layout_from_channels(
 						wfex->nChannels);
-					out.format = AUDIO_FORMAT_FLOAT;
+					/* 平面 float: 与 libobs 内部音频流一致 */
+					out.format = AUDIO_FORMAT_FLOAT_PLANAR;
 					CoTaskMemFree(wfex);
 					ok = true;
 				}
@@ -771,7 +808,8 @@ bool query_source_format(obs_source_t *source, struct resample_info &out,
 		if (obs_get_audio_info(&oai)) {
 			out.samples_per_sec = oai.samples_per_sec;
 			out.speakers = oai.speakers;
-			out.format = AUDIO_FORMAT_FLOAT;
+			/* 平面 float: 与 libobs 内部音频流一致 */
+			out.format = AUDIO_FORMAT_FLOAT_PLANAR;
 			ok = true;
 		}
 	}
