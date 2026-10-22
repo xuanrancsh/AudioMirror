@@ -12,8 +12,9 @@
  *        用户不需要去关 OBS 的麦克风;
  *      - 每个输出设备注册一次, param = 该设备的渲染器,
  *        增删单个设备互不影响;
- *      - 回调拿到的是源输出格式的平面 float(已过源的音量/静音),
- *        win-wasapi 采集源的格式 = 所采设备的 mix format。
+ *      - 回调拿到的是源输出格式的平面 float(不随 OBS 混音器的静音/
+ *        隐藏/音量变化: 那三者只影响 OBS 自己的混音与监听, 采集数据
+ *        仍是真实音频), win-wasapi 采集源的格式 = 所采设备的 mix format。
  *   2. 重采样: 每设备一个 libobs audio_resampler_t
  *      (源格式 -> 该设备 mix format, float), 平面 -> 交错。
  *   3. 输出: WASAPI shared mode, 严格按 GetMixFormat() 的格式;
@@ -45,6 +46,7 @@
 #include <obs-frontend-api.h>
 #include <obs.h>
 #include <util/config-file.h>
+#include <util/platform.h>
 #include <media-io/audio-io.h>
 #include <media-io/audio-resampler.h>
 
@@ -166,6 +168,16 @@ public:
 	bool active() const { return active_.load(std::memory_order_relaxed); }
 	const QString &deviceId() const { return device_id_; }
 
+	/* 无音频输入诊断用时间戳(纳秒); 详见上面两个成员 */
+	uint64_t startedNs() const
+	{
+		return started_ns_.load(std::memory_order_relaxed);
+	}
+	uint64_t lastPacketNs() const
+	{
+		return last_packet_ns_.load(std::memory_order_relaxed);
+	}
+
 	/* 当前积压(毫秒) = 该路实际监听延迟; 未运行返回 -1 */
 	double latencyMs() const;
 
@@ -181,6 +193,12 @@ private:
 	mutable std::recursive_mutex mtx_;
 	std::atomic<bool> active_{false};
 	std::atomic<double> volume_pct_{100.0};
+
+	/* 无音频输入诊断时间戳(os_gettime_ns 单调时钟, 纳秒):
+	 * started_ns_ = start() 成功时刻;
+	 * last_packet_ns_ = 最近一次真正收到桌面音频包的时刻(0 = 未收到)。 */
+	std::atomic<uint64_t> started_ns_{0};
+	std::atomic<uint64_t> last_packet_ns_{0};
 
 	QString device_id_;
 
@@ -328,6 +346,8 @@ bool WasapiRenderer::start(const struct resample_info &src)
 	}
 
 	active_.store(true, std::memory_order_relaxed);
+	last_packet_ns_.store(0, std::memory_order_relaxed);
+	started_ns_.store(os_gettime_ns(), std::memory_order_relaxed);
 	AM_LOG(LOG_INFO, "%s: 已开始 (%uHz %uch %ubit%s, 缓冲 %u 帧)",
 	       qUtf8Printable(device_id_), sample_rate_, channels_, dev_bits_,
 	       dev_float_ ? " float" : "", buffer_frames_);
@@ -380,6 +400,8 @@ void WasapiRenderer::shutdownLocked()
 	scratch_.clear();
 	scratch_.shrink_to_fit();
 	active_.store(false, std::memory_order_relaxed);
+	started_ns_.store(0, std::memory_order_relaxed);
+	last_packet_ns_.store(0, std::memory_order_relaxed);
 }
 
 /* 交错 float32 -> 设备原始格式, 同时应用本设备音量增益 */
@@ -513,6 +535,9 @@ void WasapiRenderer::writeCaptured(const struct audio_data *audio)
 	    !render_ || !audio || audio->frames == 0 || !audio->data[0])
 		return;
 
+	/* 诊断: 记下最近一次真正收到包的时刻(无音频输入判定用) */
+	last_packet_ns_.store(os_gettime_ns(), std::memory_order_relaxed);
+
 	/* 1) 源格式(平面 float) -> 本设备格式(平面 float)。
 	 *    audio_resampler_resample 内部自管输出缓冲, 会在 output[]
 	 *    里填好各声道的指针; ts_offset 是它的出参, 忽略即可。 */
@@ -586,8 +611,16 @@ void on_source_audio(void *param, obs_source_t *source, const struct audio_data 
 		     bool muted)
 {
 	(void)source;
-	if (muted)
-		return; /* 源被静音/隐藏: 不转发 */
+	/* libobs 的 muted 只表示该源在 OBS 混音器里被静音/隐藏
+	 * (obs-source.c source_muted: !enabled || user_muted / push_to_mute),
+	 * 音频数据本身仍是真实音频 —— 静音只影响 OBS 自己的混音与监听。
+	 * 本插件的勾选 + 音量滑条才是路由意图, 因此一律转发。 */
+	if (muted) {
+		static std::atomic<bool> warned{false};
+		if (!warned.exchange(true))
+			AM_LOG(LOG_WARNING,
+			       "桌面音频源在 OBS 中被静音/隐藏, 仍继续转发");
+	}
 	auto *r = static_cast<WasapiRenderer *>(param);
 	if (!r || !r->active())
 		return;
@@ -1086,6 +1119,26 @@ double mirror::deviceLatencyMs(const QString &deviceId)
 	Q_UNUSED(deviceId)
 #endif
 	return -1.0;
+}
+
+bool mirror::deviceAudioStalled(const QString &deviceId)
+{
+#ifdef _WIN32
+	std::lock_guard<std::mutex> lk(g_engine_mtx);
+	const WasapiRenderer *r = findRenderer(deviceId);
+	if (!r || !r->active())
+		return false;
+	const uint64_t now = os_gettime_ns();
+	/* 已收到过包: 看最近一包; 还没收到: 看启动时刻(2s 宽容) */
+	const uint64_t last =
+		r->lastPacketNs() ? r->lastPacketNs() : r->startedNs();
+	if (last == 0 || now <= last)
+		return false;
+	return now - last > 2000000000ull; /* 2 秒 */
+#else
+	Q_UNUSED(deviceId)
+	return false;
+#endif
 }
 
 QString mirror::deviceFormat(const QString &deviceId)

@@ -318,9 +318,27 @@ void MirrorWindow::refreshStatus()
 	}
 
 	if (mirror::isActive()) {
-		statusLabel_->setText(QString::fromUtf8(obs_module_text(
-					 "AudioMirror.Window.Status.Running"))
-					      .arg(enabledCount));
+		/* 有启用位超过 2 秒收不到音频包 = 桌面音频源没在产出
+		 * (不在当前场景/被移除/采集失败), 提示用户去排查。 */
+		bool stalled = false;
+		for (const auto &s : slots_) {
+			const QString dev = s.device->currentData().toString();
+			if (s.enable->isChecked() && !dev.isEmpty() &&
+			    mirror::deviceAudioStalled(dev)) {
+				stalled = true;
+				break;
+			}
+		}
+		if (stalled) {
+			statusLabel_->setText(QString::fromUtf8(
+				obs_module_text(
+					"AudioMirror.Window.Status.Stalled")));
+		} else {
+			statusLabel_->setText(QString::fromUtf8(
+				obs_module_text(
+					"AudioMirror.Window.Status.Running"))
+				.arg(enabledCount));
+		}
 	} else if (!anyDevice) {
 		statusLabel_->setText(QString::fromUtf8(
 			obs_module_text("AudioMirror.Window.Status.NoDevice")));
@@ -335,13 +353,25 @@ void MirrorWindow::refreshStatus()
 		const QString dev = s.device->currentData().toString();
 		const bool on = running && s.enable->isChecked() && !dev.isEmpty();
 		if (on) {
-			const double ms = mirror::deviceLatencyMs(dev);
-			s.latency->setText(ms >= 0.0
-						   ? QStringLiteral("%1 ms")
-							     .arg(ms, 0, 'f', 1)
-						   : QString());
+			if (mirror::deviceAudioStalled(dev)) {
+				/* 没有音频输入: 别把 0.0 ms 误显示成正常低延迟 */
+				s.latency->setText(QString::fromUtf8(
+					obs_module_text(
+						"AudioMirror.Window.Status.NoAudio")));
+				s.latency->setStyleSheet(
+					QStringLiteral("color:#BA7517;"));
+			} else {
+				s.latency->setStyleSheet(QString());
+				const double ms = mirror::deviceLatencyMs(dev);
+				s.latency->setText(ms >= 0.0
+							   ? QStringLiteral("%1 ms")
+								     .arg(ms, 0,
+									  'f', 1)
+							   : QString());
+			}
 		} else {
 			s.latency->clear();
+			s.latency->setStyleSheet(QString());
 		}
 	}
 }

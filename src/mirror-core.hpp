@@ -70,6 +70,13 @@ void setDeviceVolume(const QString &deviceId, double percent);
  * UI 定时轮询用于实时显示。 */
 double deviceLatencyMs(const QString &deviceId);
 
+/* 无音频输入诊断: 渲染器在运行, 但超过 2 秒没收到桌面音频包
+ * (源不在当前场景/被移除/采集失败)。UI 用于在延迟位置给出
+ * "无音频输入"提示, 避免把 0.0 ms 误显示成正常低延迟。
+ * 注意: OBS 混音器里的静音/隐藏不算 —— 那只是显示状态, 采集
+ * 数据仍照常转发。 */
+bool deviceAudioStalled(const QString &deviceId);
+
 /* 运行中设备的格式描述(如 "48000 Hz · 24 bit"); 未运行返回空串 */
 QString deviceFormat(const QString &deviceId);
 
