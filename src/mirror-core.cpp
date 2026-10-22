@@ -572,18 +572,24 @@ void WasapiRenderer::writeCaptured(const struct audio_data *audio)
 	 * 会空指针解引用(c0000005), 直接崩掉整个 OBS。这里显式拦截:
 	 * 丢包 + 报错, 保住 OBS。日志限流: 正常永不触发, 异常时也不
 	 * 要 10ms 一条刷爆日志(仿 on_source_audio 的一次性警告)。 */
-	static std::atomic<uint32_t> dropped{0};
-	const uint32_t n = dropped.fetch_add(1, std::memory_order_relaxed);
-	if (n < 5) {
-		AM_LOG(LOG_ERROR,
-		       "重采样输出声道不足(%u/%u), 丢弃本包 —— "
-		       "请检查 dst_info_.format 应为 "
-		       "AUDIO_FORMAT_FLOAT_PLANAR",
-		       c, channels_);
-	} else if (n == 5) {
-		AM_LOG(LOG_ERROR, "重采样输出声道不足: 后续丢包不再刷屏");
+	for (UINT32 c = 1; c < channels_; ++c) {
+		if (!planes[c]) {
+			static std::atomic<uint32_t> dropped{0};
+			const uint32_t n = dropped.fetch_add(
+				1, std::memory_order_relaxed);
+			if (n < 5) {
+				AM_LOG(LOG_ERROR,
+				       "重采样输出声道不足(%u/%u), 丢弃本包"
+				       " —— 请检查 dst_info_.format 应为 "
+				       "AUDIO_FORMAT_FLOAT_PLANAR",
+				       c, channels_);
+			} else if (n == 5) {
+				AM_LOG(LOG_ERROR,
+				       "重采样输出声道不足: 后续丢包不再刷屏");
+			}
+			return;
+		}
 	}
-	return;
 
 	/* 2) 平面 -> 交错 */
 	const size_t need = (size_t)out_frames * channels_;
