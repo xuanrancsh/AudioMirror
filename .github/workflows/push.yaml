@@ -1,0 +1,66 @@
+name: Push to master
+run-name: ${{ github.ref_name }} push run 🚀
+on:
+  push:
+    branches: [master, main]
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  build-project:
+    name: Build Project 🧱
+    uses: ./.github/workflows/build-project.yaml
+    secrets: inherit
+    permissions:
+      contents: read
+
+  create-release:
+    name: Create Release 🛫
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    needs: build-project
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check Release Tag ☑️
+        id: check
+        run: |
+          : Check Release Tag ☑️
+          shopt -s extglob
+          case "${GITHUB_REF_NAME}" in
+            +([0-9]).+([0-9]).+([0-9]) )
+              echo 'validTag=true' >> $GITHUB_OUTPUT
+              echo 'prerelease=false' >> $GITHUB_OUTPUT
+              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              ;;
+            +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
+              echo 'validTag=true' >> $GITHUB_OUTPUT
+              echo 'prerelease=true' >> $GITHUB_OUTPUT
+              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+              ;;
+            *) echo 'validTag=false' >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Download Build Artifacts 📥
+        uses: actions/download-artifact@v4
+        if: fromJSON(steps.check.outputs.validTag)
+
+      - name: Create Release 🛫
+        if: fromJSON(steps.check.outputs.validTag)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
+          tag_name: ${{ steps.check.outputs.version }}
+          name: AudioMirror ${{ steps.check.outputs.version }}
+          files: |
+            ${{ github.workspace }}/*.zip
+            ${{ github.workspace }}/*.exe
