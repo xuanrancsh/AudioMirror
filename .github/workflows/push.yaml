@@ -63,6 +63,8 @@ jobs:
           prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
           tag_name: ${{ steps.check.outputs.version }}
           name: AudioMirror ${{ steps.check.outputs.version }}
+          # download-artifact 会把产物解压到以 artifact 名命名的子目录,
+          # 必须用 ** 递归匹配才能拿到 zip/exe
           files: |
-            ${{ github.workspace }}/*.zip
-            ${{ github.workspace }}/*.exe
+            ${{ github.workspace }}/**/*.zip
+            ${{ github.workspace }}/**/*.exe
