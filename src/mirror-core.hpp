@@ -79,7 +79,9 @@ void stopAll();
 
 /* ---------- 配置持久化(OBS user config, 段 "AudioMirror") ---------- */
 QVector<MirrorSlot> cfgSlots();                 /* 固定 5 个, 默认全关 */
-void cfgSetSlots(const QVector<MirrorSlot> &slots);
+/* 注意: 形参名不能用 slots —— Qt 把 slots 定义为空宏(signals/slots
+ * 机制), 会被预处理掉导致语法错误。 */
+void cfgSetSlots(const QVector<MirrorSlot> &slotList);
 double cfgDeviceVolume(const QString &id);      /* 按设备 ID, 默认 100 */
 void cfgSetDeviceVolume(const QString &id, double percent);
 bool cfgAutoStart();                            /* 默认 true: OBS 运行时自动开启 */

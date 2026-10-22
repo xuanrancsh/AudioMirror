@@ -1147,11 +1147,11 @@ static void cfg_init_defaults()
 
 QVector<MirrorSlot> mirror::cfgSlots()
 {
-	QVector<MirrorSlot> slots;
+	QVector<MirrorSlot> out;
 	config_t *c = user_config();
 	if (!c) {
-		slots.resize(kSlotCount);
-		return slots;
+		out.resize(kSlotCount);
+		return out;
 	}
 	cfg_init_defaults();
 	for (int i = 1; i <= kSlotCount; ++i) {
@@ -1163,24 +1163,24 @@ QVector<MirrorSlot> mirror::cfgSlots()
 			config_get_string(c, CFG_SECTION,
 					  (p + "Device").constData()));
 		s.volume = 100.0;
-		slots.append(s);
+		out.append(s);
 	}
-	return slots;
+	return out;
 }
 
-void mirror::cfgSetSlots(const QVector<MirrorSlot> &slots)
+void mirror::cfgSetSlots(const QVector<MirrorSlot> &slotList)
 {
 	config_t *c = user_config();
 	if (!c)
 		return;
 	cfg_init_defaults();
-	for (int i = 0; i < kSlotCount && i < slots.size(); ++i) {
+	for (int i = 0; i < kSlotCount && i < slotList.size(); ++i) {
 		const QByteArray p =
 			QStringLiteral("Slot%1.").arg(i + 1).toUtf8();
 		config_set_bool(c, CFG_SECTION, (p + "Enabled").constData(),
-				slots[i].enabled);
+				slotList[i].enabled);
 		config_set_string(c, CFG_SECTION, (p + "Device").constData(),
-				  slots[i].device.toUtf8().constData());
+				  slotList[i].device.toUtf8().constData());
 	}
 	config_save_safe(c, "tmp", "bak");
 }
