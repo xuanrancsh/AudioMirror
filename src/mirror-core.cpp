@@ -36,7 +36,6 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <obs.h>
-#include <obs-scene.h>
 #include <util/config-file.h>
 #include <media-io/audio-io.h>
 
