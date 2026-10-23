@@ -12,20 +12,26 @@
  *        用户不需要去关 OBS 的麦克风;
  *      - 每个输出设备注册一次, param = 该设备的渲染器,
  *        增删单个设备互不影响;
- *      - 回调拿到的是源输出格式的平面 float(不随 OBS 混音器的静音/
- *        隐藏/音量变化: 那三者只影响 OBS 自己的混音与监听, 采集数据
- *        仍是真实音频), win-wasapi 采集源的格式 = 所采设备的 mix format。
+ *      - 回调数据是 OBS **全局音频格式**的平面 float(不是源原生
+ *        格式! obs-source.c: obs_source_output_audio -> process_audio
+ *        -> reset_resampler 先把源重采样到全局率/全局平面 float,
+ *        再过滤镜才触发回调)。全局率由 obs_get_audio_info() 动态
+ *        取(用户设 44100 就是 44100, 设 48000 就是 48000, 不硬编码),
+ *        并计入身份戳, 用户在 OBS 里改设置后自动重建。
+ *        回调不随 OBS 混音器的静音/隐藏/音量变化(那三者只影响
+ *        OBS 自己的混音与监听, 采集数据仍是真实音频)。
  *   2. 重采样: 每设备一个 libobs audio_resampler_t
- *      (源格式 -> 该设备 mix format)。src/dst 的 format 必须都是
- *      AUDIO_FORMAT_FLOAT_PLANAR: libobs 回调数据是平面 float,
+ *      (OBS 全局格式 -> 该设备 mix format)。src/dst 的 format 必须
+ *      都是 AUDIO_FORMAT_FLOAT_PLANAR: libobs 回调数据是平面 float,
  *      且 audio_resampler_resample 只回填 output_planes 个 output
  *      指针(平面=全声道, 交错=仅 1 个) —— 填交错会让 planes[1..]
  *      为 NULL, 交错循环空指针解引用崩掉 OBS。平面 -> 交错在本插件
  *      的 writeCaptured 里做。
  *   3. 输出: WASAPI shared mode, 严格按 GetMixFormat() 的格式;
- *      100ms 缓冲只作抖动余量, 实际延迟由"自适应积压控制"钉在
- *      一个 OBS 音频块的量级(~21ms @48kHz), 设备时钟漂移每次
- *      最多丢 1ms, 听感无感但延迟永不累积。
+ *      300ms 缓冲(容量≠延迟: 不预填, 只在收到包时写), 吸收送数
+ *      抖动防欠载爆音; 稳态延迟由"自适应积压控制"钉在一个 OBS
+ *      音频块的量级, 设备时钟漂移每次最多丢 1ms, 听感无感但延迟
+ *      永不累积。
  *   4. 全程不改 OBS 混音器/音轨/监听设备设置, 不用 audio_monitor。
  *
  * 线程模型与锁纪律(崩溃安全的关键, 改动前必读):
@@ -315,9 +321,12 @@ bool WasapiRenderer::start(const struct resample_info &src)
 	}
 	frame_bytes_ = channels_ * (dev_bits_ / 8);
 
-	/* 100ms 缓冲仅作抖动余量(headroom): 实际延迟由积压控制决定,
-	 * 不把缓冲本身开成 1 秒(旧实现那样延迟会爆炸)。 */
-	hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000 /* 100ms */,
+	/* 300ms 缓冲(对齐 libobs 音频监听的容量级思路, 只是它用 1s):
+	 * 容量大不等于延迟高 —— 我们不预填, 只在收到包时写入, 稳态
+	 * 延迟仍是"一个包"的量级; 但容量大能吸收送数节奏抖动
+	 * (蓝牙设备/use-device-timing 的虚拟设备都可能突发送数),
+	 * 避免缓冲饿死造成爆音。100ms 在抖动下会偶发欠载。 */
+	hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 3000000 /* 300ms */,
 				 0, wfex, nullptr);
 	CoTaskMemFree(wfex);
 	if (FAILED(hr)) {
@@ -365,9 +374,11 @@ bool WasapiRenderer::start(const struct resample_info &src)
 	active_.store(true, std::memory_order_relaxed);
 	last_packet_ns_.store(0, std::memory_order_relaxed);
 	started_ns_.store(os_gettime_ns(), std::memory_order_relaxed);
-	AM_LOG(LOG_INFO, "%s: 已开始 (%uHz %uch %ubit%s, 缓冲 %u 帧)",
+	AM_LOG(LOG_INFO,
+	       "%s: 已开始 (%uHz %uch %ubit%s, 缓冲 %u 帧; 重采样 %uHz->%uHz)",
 	       qUtf8Printable(device_id_), sample_rate_, channels_, dev_bits_,
-	       dev_float_ ? " float" : "", buffer_frames_);
+	       dev_float_ ? " float" : "", buffer_frames_, src.samples_per_sec,
+	       sample_rate_);
 	return true;
 }
 
@@ -731,16 +742,31 @@ obs_source_t *find_desktop_audio_source()
 	return found; /* 调用方负责 release */
 }
 
-/* 取桌面音频源的音频格式。
- * win-wasapi 采集源的格式 = 所采设备的 mix format(float);
- * 源设置的 device_id 为 "default"/空 时取系统默认渲染端点。
- * 查询失败回退到 OBS 全局音频设置。
- * resolved_id(可选): 实际解析到的端点 ID —— 默认设备被更换时,
- * 用它做"身份戳"判断重采样器是否需要按新格式重建。 */
+/* 取桌面音频源送进采集回调的音频格式。
+ *
+ * 关键(2026-10-23, 杂音 bug 的根因): 回调拿到的**不是**源原生
+ * 格式, 而是 OBS 全局音频格式! 证据链(obs-source.c):
+ *   obs_source_output_audio -> process_audio -> reset_resampler:
+ *     source->resampler = audio_resampler_create(全局格式, 源原生格式)
+ *     -> 源音频先被重采样到"全局率 + 全局平面 float", 再过滤镜,
+ *        最后才由 source_output_audio_data 触发我们的回调。
+ *   win-wasapi 源原生 = 所采端点 mix format(如 FxSound 44100Hz),
+ *   而 OBS 全局常为 48000Hz —— 两者多半不同。
+ *
+ * 曾经的错法: 按端点 mix format(44100)建我们的重采样器, 等于把
+ * 已经是 48k 的回调数据再升 48000/44100=1.089 倍 -> 每秒多灌
+ * 8.9% 数据 -> 积压爆表 -> 积压控制持续丢帧 -> 监听端是连续的
+ * 撕裂/滋滋声("有很大杂音, 根本听不清")。
+ *
+ * 因此: 格式/采样率/声道一律取 obs_get_audio_info() —— 这是
+ * 运行时动态值, 用户 OBS 里设 44100 就是 44100, 设 48000 就是
+ * 48000(两种都存在, 不硬编码); 端点枚举仅用于 resolved_id
+ * (默认设备更换检测), 与格式无关。 */
 bool query_source_format(obs_source_t *source, struct resample_info &out,
 			 QString *resolved_id = nullptr)
 {
-	bool ok = false;
+	/* 1) 端点解析: 仅用于身份戳(默认设备被换掉时能发现),
+	 *    拿不到不影响格式(格式本来就不来自端点)。 */
 	std::wstring device_id;
 	bool use_default = true;
 
@@ -781,25 +807,6 @@ bool query_source_format(obs_source_t *source, struct resample_info &out,
 					CoTaskMemFree(wId);
 				}
 			}
-			IAudioClient *client = nullptr;
-			if (SUCCEEDED(dev->Activate(__uuidof(IAudioClient),
-						    CLSCTX_ALL, nullptr,
-						    (void **)&client)) &&
-			    client) {
-				WAVEFORMATEX *wfex = nullptr;
-				if (SUCCEEDED(client->GetMixFormat(&wfex)) &&
-				    wfex) {
-					out.samples_per_sec =
-						wfex->nSamplesPerSec;
-					out.speakers = layout_from_channels(
-						wfex->nChannels);
-					/* 平面 float: 与 libobs 内部音频流一致 */
-					out.format = AUDIO_FORMAT_FLOAT_PLANAR;
-					CoTaskMemFree(wfex);
-					ok = true;
-				}
-				client->Release();
-			}
 			dev->Release();
 		}
 		enumerator->Release();
@@ -808,18 +815,21 @@ bool query_source_format(obs_source_t *source, struct resample_info &out,
 	if (com_owned)
 		CoUninitialize();
 
-	if (!ok) {
-		/* 回退: OBS 全局音频设置(默认 48kHz 立体声 float) */
-		struct obs_audio_info oai;
-		if (obs_get_audio_info(&oai)) {
-			out.samples_per_sec = oai.samples_per_sec;
-			out.speakers = oai.speakers;
-			/* 平面 float: 与 libobs 内部音频流一致 */
-			out.format = AUDIO_FORMAT_FLOAT_PLANAR;
-			ok = true;
-		}
-	}
-	return ok;
+	/* 2) 率/声道 = OBS 全局设置(回调实际交付的格式)。
+	 *    动态值: 用户在 OBS 设置里改采样率, 这里立即跟着变;
+	 *    OBS 里设 44100 就是 44100, 设 48000 就是 48000
+	 *    (两种都存在, 不硬编码任一采样率)。
+	 *    注意: obs_audio_info 只有 samples_per_sec/speakers 两个
+	 *    成员(OBS 32.0.4 obs.h 实锤, 无 format 字段); OBS 全局
+	 *    混音恒为平面 float, 故 format 直接给 FLOAT_PLANAR。 */
+	struct obs_audio_info oai = {};
+	if (!obs_get_audio_info(&oai))
+		return false;
+
+	out.samples_per_sec = oai.samples_per_sec;
+	out.speakers = oai.speakers;
+	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	return true;
 }
 
 /* 保障默认桌面音频采集源存在(详见头文件注释)。
@@ -1014,8 +1024,10 @@ QString mirror::applySelection(const QStringList &deviceIds,
 		return QStringLiteral("无法确定桌面音频的音频格式");
 	}
 
-	/* 身份戳: 源名 + 设置里的设备 + 实际解析到的端点。
-	 * 用户换源/改设备/默认设备更换后要按新格式重建。 */
+	/* 身份戳: 源名 + 设置里的设备 + 实际解析到的端点 + OBS 全局
+	 * 音频格式(率/声道)。用户换源/改设备/默认设备更换/在 OBS 设置
+	 * 里改全局采样率(44100<->48000 都有人用)后, 任一变化都按新
+	 * 格式重建重采样器 —— 运行时动态适配, 不硬编码任一采样率。 */
 	QString token = QString::fromUtf8(obs_source_get_name(cap));
 	{
 		obs_data_t *s = obs_source_get_settings(cap);
@@ -1027,6 +1039,10 @@ QString mirror::applySelection(const QStringList &deviceIds,
 		}
 	}
 	token += QLatin1Char('|') + resolved_id;
+	token += QStringLiteral("|%1/%2/%3")
+			 .arg(src_info.samples_per_sec)
+			 .arg(static_cast<int>(src_info.speakers))
+			 .arg(static_cast<int>(src_info.format));
 
 	/* 3. 归一化目标设备: 去空/去重/剔除默认播放设备/只认已知设备 */
 	const auto devs = enumDevices();
